@@ -7,6 +7,7 @@ from typing import List, Optional
 from fastapi import FastAPI, Depends, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from pypdf import PdfReader
 
@@ -23,15 +24,15 @@ if __package__ in (None, ""):
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-from backend.database import engine, Base, get_db
+from backend.database import engine, Base, get_db, init_db
 from backend.models import (
     ComplaintDB, ComplaintFormSchema, RiskAssessmentSchema,
     ChatRequest, ChatResponse, ComplaintSaveRequest, CompletenessCheckSchema
 )
 from backend.agent.graph import process_qms_prompt, calculate_completeness
 
-# Initialize Database Tables
-Base.metadata.create_all(bind=engine)
+# Initialize Database Tables & Migrations
+init_db()
 
 app = FastAPI(
     title="AIVOA QMS Customer Complaint API",
@@ -39,18 +40,21 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Enable CORS for React frontend
+# Configurable CORS for both unified and separate deployments
+allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "*")
+allowed_origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()] if allowed_origins_env != "*" else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=True if allowed_origins != ["*"] else False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.get("/")
-def read_root():
+@app.get("/api/health")
+def health_check():
     return {
         "status": "online",
         "system": "AIVOA Pharma QMS Customer Complaint Management",
@@ -224,7 +228,46 @@ def get_sample_doc(doc_type: str):
     raise HTTPException(status_code=404, detail="Sample document not found")
 
 
+# Serve built React frontend SPA if dist directory exists
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+frontend_dist = os.getenv(
+    "FRONTEND_DIST",
+    os.path.join(base_dir, "frontend", "dist")
+)
+
+if os.path.exists(frontend_dist):
+    assets_dir = os.path.join(frontend_dist, "assets")
+    if os.path.exists(assets_dir):
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="API endpoint not found")
+        
+        file_path = os.path.join(frontend_dist, full_path)
+        if full_path and os.path.exists(file_path) and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        
+        index_path = os.path.join(frontend_dist, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+        
+        return JSONResponse({"status": "online", "system": "AIVOA Pharma QMS Customer Complaint Management"})
+else:
+    @app.get("/")
+    def read_root():
+        return {
+            "status": "online",
+            "system": "AIVOA Pharma QMS Customer Complaint Management",
+            "docs_url": "/docs"
+        }
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("backend.main:app", host=host, port=port, reload=False)
+

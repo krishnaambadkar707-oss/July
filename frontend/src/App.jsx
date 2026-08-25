@@ -11,6 +11,7 @@ import SettingsModal from './components/SettingsModal';
 import { setSavedComplaints, resetForm } from './store/complaintSlice';
 import { addMessage } from './store/chatSlice';
 import { addNotification } from './store/notificationSlice';
+import { getApiUrl } from './config/api';
 
 export default function App() {
   const dispatch = useDispatch();
@@ -27,7 +28,7 @@ export default function App() {
   // Fetch Saved Complaints from FastAPI DB on load
   const fetchComplaints = async () => {
     try {
-      const res = await fetch('/api/complaints');
+      const res = await fetch(getApiUrl('/api/complaints'));
       if (res.ok) {
         const data = await res.json();
         dispatch(setSavedComplaints(data));
@@ -50,7 +51,7 @@ export default function App() {
 
     setIsSaving(true);
     try {
-      const res = await fetch('/api/complaints', {
+      const res = await fetch(getApiUrl('/api/complaints'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

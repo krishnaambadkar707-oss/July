@@ -29,25 +29,50 @@ class AgentState(TypedDict):
 
 
 def get_llm():
+    # 1. Groq Models Support
     groq_key = os.getenv("GROQ_API_KEY")
     if groq_key:
-        model_name = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-        try:
-            return ChatGroq(model_name=model_name, groq_api_key=groq_key, temperature=0.1)
-        except Exception:
+        groq_models = [
+            os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+            "llama-3.3-70b-versatile",
+            "llama-3.1-70b-versatile",
+            "llama-3.1-8b-instant",
+            "mixtral-8x7b-32768",
+            "gemma2-9b-it"
+        ]
+        for model_name in groq_models:
             try:
-                return ChatGroq(model_name="gemma2-9b-it", groq_api_key=groq_key, temperature=0.1)
+                return ChatGroq(model_name=model_name, groq_api_key=groq_key, temperature=0.1)
             except Exception:
-                pass
+                try:
+                    return ChatGroq(model=model_name, groq_api_key=groq_key, temperature=0.1)
+                except Exception:
+                    continue
 
+    # 2. Google Gemini Models Support
     gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if gemini_key:
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
-            return ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=gemini_key, temperature=0.1)
+            for m in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]:
+                try:
+                    return ChatGoogleGenerativeAI(model=m, google_api_key=gemini_key, temperature=0.1)
+                except Exception:
+                    continue
         except Exception:
             pass
+
+    # 3. OpenAI Models Support
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if openai_key:
+        try:
+            from langchain_openai import ChatOpenAI
+            return ChatOpenAI(model="gpt-4o-mini", api_key=openai_key, temperature=0.1)
+        except Exception:
+            pass
+
     return None
+
 
 
 def format_date_str(raw_date: str) -> str:

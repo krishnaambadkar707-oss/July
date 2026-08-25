@@ -10,6 +10,7 @@ import {
 } from '../store/chatSlice';
 import { setExtractedData } from '../store/complaintSlice';
 import { addNotification } from '../store/notificationSlice';
+import { getApiUrl } from '../config/api';
 import {
   Upload,
   FileText,
@@ -55,7 +56,7 @@ export default function AICopilotPanel() {
     dispatch(setIsLoading(true));
 
     try {
-      const res = await fetch('/api/chat', {
+      const res = await fetch(getApiUrl('/api/chat'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -115,7 +116,7 @@ export default function AICopilotPanel() {
     }, 200);
 
     try {
-      const res = await fetch('/api/extract-document', {
+      const res = await fetch(getApiUrl('/api/extract-document'), {
         method: 'POST',
         body: formData
       });
@@ -152,7 +153,7 @@ export default function AICopilotPanel() {
   // Load Sample File Button
   const handleLoadSample = async (type) => {
     try {
-      const res = await fetch(`/api/sample-docs/${type}`);
+      const res = await fetch(getApiUrl(`/api/sample-docs/${type}`));
       if (!res.ok) throw new Error('Sample file download failed');
       const blob = await res.blob();
       const filename = type === 'pdf' ? 'amoxicillin_discoloration_complaint.pdf' : 'metformin_api_impurity_email.eml';

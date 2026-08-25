@@ -1,0 +1,13 @@
+# Render Blueprint Configuration
+# Deploy whole application (Frontend + Backend) as a Single Unified Web Service via Docker
+
+services:
+  - type: web
+    name: aivoa-qms-complaint-app
+    env: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        value: sqlite:///./qms_complaints.db
