@@ -11,6 +11,7 @@ import {
 import { setExtractedData } from '../store/complaintSlice';
 import { addNotification } from '../store/notificationSlice';
 import { getApiUrl } from '../config/api';
+import { processClientAIChat } from '../utils/aiCopilotEngine';
 import {
   Upload,
   FileText,
@@ -46,7 +47,7 @@ export default function AICopilotPanel() {
     scrollToBottom();
   }, [messages]);
 
-  // Handle Send Prompt
+  // Handle Send Prompt (with seamless backend API + client-side AI engine failover)
   const handleSendPrompt = async (textToSend) => {
     const prompt = textToSend || inputPrompt;
     if (!prompt.trim() || isLoading) return;
@@ -56,18 +57,28 @@ export default function AICopilotPanel() {
     dispatch(setIsLoading(true));
 
     try {
-      const res = await fetch(getApiUrl('/api/chat'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt,
-          current_form_state: form
-        })
-      });
+      let data = null;
+      try {
+        const res = await fetch(getApiUrl('/api/chat'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt,
+            current_form_state: form
+          })
+        });
 
-      if (!res.ok) throw new Error('Failed to get response from AI assistant');
+        if (res.ok) {
+          data = await res.json();
+        }
+      } catch (netErr) {
+        console.warn("Backend server offline. Running client-side AI Copilot fallback:", netErr);
+      }
 
-      const data = await res.json();
+      if (!data) {
+        data = processClientAIChat(prompt, form);
+      }
+
       dispatch(setExtractedData(data));
       let botReply = data.reply;
       if (data.risk_assessment?.precautions && data.risk_assessment.precautions !== 'Awaiting AI extraction...') {
@@ -91,7 +102,7 @@ export default function AICopilotPanel() {
     } catch (err) {
       dispatch(addMessage({ sender: 'bot', text: `Error: ${err.message}` }));
       dispatch(addNotification({
-        title: 'Extraction Failed',
+        title: 'Extraction Error',
         message: err.message,
         type: 'critical'
       }));
@@ -100,7 +111,7 @@ export default function AICopilotPanel() {
     }
   };
 
-  // Handle Document Upload
+  // Handle Document Upload (with backend + client-side parser failover)
   const handleFileUpload = async (file) => {
     if (!file) return;
 
@@ -116,17 +127,32 @@ export default function AICopilotPanel() {
     }, 200);
 
     try {
-      const res = await fetch(getApiUrl('/api/extract-document'), {
-        method: 'POST',
-        body: formData
-      });
+      let data = null;
+      try {
+        const res = await fetch(getApiUrl('/api/extract-document'), {
+          method: 'POST',
+          body: formData
+        });
+        if (res.ok) {
+          data = await res.json();
+        }
+      } catch (netErr) {
+        console.warn("Backend document extraction offline. Using client-side document parser fallback:", netErr);
+      }
 
       clearInterval(interval);
       dispatch(setExtractionProgress(100));
 
-      if (!res.ok) throw new Error('Failed to extract document');
+      if (!data) {
+        let textContent = "";
+        try {
+          textContent = await file.text();
+        } catch (e) {
+          textContent = file.name;
+        }
+        data = processClientAIChat(textContent || file.name, {});
+      }
 
-      const data = await res.json();
       dispatch(setExtractedData(data));
       dispatch(addMessage({ sender: 'bot', text: data.reply }));
 
@@ -153,12 +179,48 @@ export default function AICopilotPanel() {
   // Load Sample File Button
   const handleLoadSample = async (type) => {
     try {
-      const res = await fetch(getApiUrl(`/api/sample-docs/${type}`));
-      if (!res.ok) throw new Error('Sample file download failed');
-      const blob = await res.blob();
+      let blob = null;
+      try {
+        const res = await fetch(getApiUrl(`/api/sample-docs/${type}`));
+        if (res.ok) blob = await res.blob();
+      } catch (e) {}
+
       const filename = type === 'pdf' ? 'amoxicillin_discoloration_complaint.pdf' : 'metformin_api_impurity_email.eml';
-      const file = new File([blob], filename, { type: blob.type });
-      handleFileUpload(file);
+      if (blob) {
+        const file = new File([blob], filename, { type: blob.type });
+        handleFileUpload(file);
+      } else {
+        const sampleText = type === 'pdf'
+          ? `APOLLO PHARMACY NETWORK - QUALITY COMPLAINT REPORT
+Date: August 12, 2026
+Source: Apollo Pharmacy Central Distribution Center
+Customer Name: Apollo Pharmacy Ltd
+Product Name: Amoxicillin Capsules
+Product Strength: 500 mg
+Batch / Lot Number: BMX24602
+Manufacturing Date: 2026-01-15
+Expiry Date: 2028-01-14
+Affected Quantity: 48 capsules
+Complaint Type: Discoloration / Appearance Defect
+Detailed Description: Apollo Pharmacy reported discolored capsules in Amoxicillin capsules 500 mg (Batch BMX24602). Upon opening blister packs, 48 capsules exhibited yellowish-brown spots on outer gelatin shells.`
+          : `From: quality@biohealthlabs.com
+To: qms-complaints@aivoa-pharma.com
+Subject: Customer Complaint: Foreign Particulate Impurity in Metformin Hydrochloride API
+Details:
+- Customer Name: BioHealth Laboratories Inc
+- Complaint Source: Email Notification
+- Product Name: Metformin Hydrochloride API
+- Grade / Strength: IP / BP Grade
+- Batch / Lot Number: MFH260712A
+- Manufacturing Date: 2026-06-10
+- Expiry Date: 2029-06-09
+- Affected Quantity: 50 kg (2 HDP drums)
+- Complaint Type: Foreign Contamination / Impurity
+Description: During raw material receiving inspection at BioHealth Labs, dark particulate inclusions were observed inside 2 HDP drums of Metformin Hydrochloride API (Batch MFH260712A).`;
+
+        const file = new File([sampleText], filename, { type: 'text/plain' });
+        handleFileUpload(file);
+      }
     } catch (e) {
       alert(`Could not load sample document: ${e.message}`);
     }

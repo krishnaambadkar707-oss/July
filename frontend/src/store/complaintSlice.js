@@ -48,9 +48,13 @@ const complaintSlice = createSlice({
       state.form[name] = value;
     },
     setExtractedData: (state, action) => {
-      const { extracted_form, risk_assessment, completeness, duplicate_found, duplicate_info } = action.payload;
+      const { extracted_form, risk_assessment, completeness, duplicate_found, duplicate_info, action_taken } = action.payload;
       if (extracted_form) {
-        state.form = { ...state.form, ...extracted_form };
+        if (action_taken === 'EDITED') {
+          state.form = { ...state.form, ...extracted_form };
+        } else {
+          state.form = { ...initialFormState, ...extracted_form };
+        }
       }
       if (risk_assessment) {
         state.riskAssessment = risk_assessment;

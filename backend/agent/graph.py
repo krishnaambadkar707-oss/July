@@ -10,12 +10,21 @@ try:
 except Exception:
     pass
 
-from langchain_groq import ChatGroq
-from langchain_core.messages import SystemMessage, HumanMessage
-from langgraph.graph import StateGraph, END
+# Safe optional imports for LangChain & LangGraph
+try:
+    from langchain_core.messages import SystemMessage, HumanMessage
+except Exception:
+    class SystemMessage:
+        def __init__(self, content): self.content = content
+    class HumanMessage:
+        def __init__(self, content): self.content = content
 
-from ..models import ComplaintFormSchema, RiskAssessmentSchema, CompletenessCheckSchema
-from .prompts import QMS_EXTRACTION_PROMPT, QMS_EDIT_PROMPT, QMS_INTENT_SYSTEM_PROMPT
+try:
+    from langgraph.graph import StateGraph, END
+    HAS_LANGGRAPH = True
+except Exception:
+    HAS_LANGGRAPH = False
+    END = "__END__"
 
 
 class AgentState(TypedDict):
@@ -28,65 +37,69 @@ class AgentState(TypedDict):
     action_taken: str
 
 
-def get_llm():
+def get_llm_candidates():
+    """Build a list of initialized LLMs from valid environment variables."""
+    candidates = []
+
     # 1. Groq Models Support
     groq_key = os.getenv("GROQ_API_KEY")
-    if groq_key:
-        groq_models = [
-            os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-            "llama-3.3-70b-versatile",
-            "llama-3.1-70b-versatile",
-            "llama-3.1-8b-instant",
-            "mixtral-8x7b-32768",
-            "gemma2-9b-it"
-        ]
-        for model_name in groq_models:
-            try:
-                return ChatGroq(model_name=model_name, groq_api_key=groq_key, temperature=0.1)
-            except Exception:
+    if groq_key and groq_key.strip() and not groq_key.lower().startswith("your_"):
+        try:
+            from langchain_groq import ChatGroq
+            groq_models = [
+                os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                "llama-3.3-70b-versatile",
+                "llama-3.1-70b-versatile",
+                "llama-3.1-8b-instant",
+                "mixtral-8x7b-32768",
+                "gemma2-9b-it"
+            ]
+            for model_name in groq_models:
                 try:
-                    return ChatGroq(model=model_name, groq_api_key=groq_key, temperature=0.1)
+                    candidates.append(ChatGroq(model_name=model_name, groq_api_key=groq_key.strip(), temperature=0.1))
                 except Exception:
-                    continue
+                    pass
+        except Exception:
+            pass
 
     # 2. Google Gemini Models Support
     gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if gemini_key:
+    if gemini_key and gemini_key.strip() and not gemini_key.lower().startswith("your_"):
         try:
             from langchain_google_genai import ChatGoogleGenerativeAI
             for m in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]:
                 try:
-                    return ChatGoogleGenerativeAI(model=m, google_api_key=gemini_key, temperature=0.1)
+                    candidates.append(ChatGoogleGenerativeAI(model=m, google_api_key=gemini_key.strip(), temperature=0.1))
                 except Exception:
-                    continue
+                    pass
         except Exception:
             pass
 
     # 3. OpenAI Models Support
     openai_key = os.getenv("OPENAI_API_KEY")
-    if openai_key:
+    if openai_key and openai_key.strip() and not openai_key.lower().startswith("your_"):
         try:
             from langchain_openai import ChatOpenAI
-            return ChatOpenAI(model="gpt-4o-mini", api_key=openai_key, temperature=0.1)
+            candidates.append(ChatOpenAI(model="gpt-4o-mini", api_key=openai_key.strip(), temperature=0.1))
         except Exception:
             pass
 
-    return None
-
+    return candidates
 
 
 def format_date_str(raw_date: str) -> str:
     if not raw_date:
         return ""
     raw_date = raw_date.strip()
-    match = re.search(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4}|\d{1,2}[-/]\d{4}|\d{4}[-/]\d{1,2}|[A-Za-z]+\s+\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4})", raw_date)
+    match = re.search(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{4}|\d{1,2}[-/]\d{4}|\d{4}[-/]\d{1,2}|[A-Za-z]+\s+\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})", raw_date)
     if match:
         raw_date = match.group(1)
     if re.match(r"^\d{4}-\d{2}-\d{2}$", raw_date):
         return raw_date
     for fmt in (
         "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%m-%Y", "%m-%d-%Y",
-        "%b %Y", "%B %Y", "%m/%Y", "%Y-%m", "%d %b %Y", "%d %B %Y"
+        "%b %Y", "%B %Y", "%m/%Y", "%Y-%m", "%d %b %Y", "%d %B %Y",
+        "%b %d, %Y", "%B %d, %Y", "%d %b, %Y", "%d %B, %Y"
     ):
         try:
             dt = datetime.strptime(raw_date, fmt)
@@ -96,15 +109,16 @@ def format_date_str(raw_date: str) -> str:
     return raw_date
 
 
-def fallback_extract(prompt: str, current_form: Dict[str, Any] = None) -> Dict[str, Any]:
+def fallback_extract(prompt: str, current_form: Dict[str, Any] = None, intent: str = "LOG_COMPLAINT") -> Dict[str, Any]:
     text = prompt.strip()
     text_lower = text.lower()
     
-    is_edit = bool(
-        current_form and (
-            any(k in text_lower for k in ["sorry", "update", "change", "correct", "edit", "instead of", "batch number is", "customer is", "quantity is", "change batch", "change customer", "mfg date is", "expiry is"])
-            or "edit complaint" in text_lower
-        )
+    is_edit = (intent == "EDIT_COMPLAINT") or bool(
+        current_form and any(k in text_lower for k in [
+            "sorry", "update", "change", "correct", "edit", "instead of",
+            "batch number is", "customer is", "quantity is", "change batch",
+            "change customer", "mfg date is", "expiry is"
+        ])
     )
 
     data = current_form.copy() if (is_edit and current_form) else {
@@ -122,41 +136,41 @@ def fallback_extract(prompt: str, current_form: Dict[str, Any] = None) -> Dict[s
         "initial_severity": "Major",
         "priority": "High",
         "suggested_next_action": "Route to QA investigation & issue replacement",
-        "risk_reasoning": "Product quality anomaly reported. Potential batch contamination or formulation defect.",
-        "capa_recommendation": "Initiate batch retention test, quarantine affected inventory, notify QA Lead.",
-        "precautions": "STANDARD QMS PRECAUTION: Place batch on temporary quarantine hold pending QA physical inspection and retention sample review."
+        "risk_reasoning": "Product quality anomaly reported. Technical investigation required.",
+        "capa_recommendation": "Quarantine affected lot, initiate retention sample analysis.",
+        "precautions": "STANDARD QMS PRECAUTION: Place batch on temporary quarantine hold pending QA physical inspection."
     }
 
-    # A. Structured Key-Value Extraction (Ideal for PDFs/Emails/Formatted Text)
+    # A. Structured Key-Value Extraction (PDFs, Emails, Formatted Documents & Text)
     kv_map = [
-        ("customer_name", r"(?:customer\s*name|customer)\s*[:=]\s*([^\n\r]+)"),
-        ("complaint_source", r"(?:complaint\s*source|source)\s*[:=]\s*([^\n\r]+)"),
-        ("product_name", r"(?:product\s*name|product)\s*[:=]\s*([^\n\r]+)"),
-        ("product_strength", r"(?:product\s*strength|strength)\s*[:=]\s*([^\n\r]+)"),
+        ("customer_name", r"(?:customer\s*name|customer|client)\s*[:=]\s*([^\n\r]+)"),
+        ("complaint_source", r"(?:complaint\s*source|source|channel)\s*[:=]\s*([^\n\r]+)"),
+        ("product_name", r"(?:product\s*name|product|drug)\s*[:=]\s*([^\n\r]+)"),
+        ("product_strength", r"(?:product\s*strength|grade\s*/?\s*strength|strength|grade)\s*[:=]\s*([^\n\r]+)"),
         ("batch_number", r"(?:batch\s*(?:/\s*lot)?\s*(?:number|no|#)?|lot\s*(?:number|no|#)?)\s*[:=]\s*([^\n\r]+)"),
         ("mfg_date", r"(?:manufacturing\s*date|manufactured\s*date|mfg\s*date|mfd\s*date|mfg\s*dt|mfd\s*dt|mfg|mfd|date\s*of\s*manufacture|dom)\s*[:=]\s*([^\n\r]+)"),
         ("expiry_date", r"(?:expiry\s*date|exp\s*date|exp\s*dt|expiry\s*dt|date\s*of\s*expiry|exp|expiry|doe)\s*[:=]\s*([^\n\r]+)"),
-        ("quantity_affected", r"(?:affected\s*quantity|quantity\s*affected|quantity)\s*[:=]\s*([^\n\r]+)"),
+        ("quantity_affected", r"(?:affected\s*quantity|quantity\s*affected|quantity|qty)\s*[:=]\s*([^\n\r]+)"),
         ("complaint_type", r"(?:complaint\s*type)\s*[:=]\s*([^\n\r]+)"),
     ]
     for key, pattern in kv_map:
         match = re.search(pattern, text, re.I)
         if match:
             val = match.group(1).strip()
-            val = re.split(r"\n|\r|Detailed|Product|Batch|Manufacturing|Expiry|Affected|Complaint", val, flags=re.I)[0].strip()
+            val = re.split(r"\n|\r|\b(?:Detailed|Description|Product|Batch|Manufacturing|Expiry|Affected|Complaint)\b", val, flags=re.I)[0].strip()
             if key in ["mfg_date", "expiry_date"]:
                 val = format_date_str(val)
-            if val and (not is_edit or not data.get(key)):
+            if val:
                 data[key] = val
 
-    # B. Natural Language Patterns (For Chat Prompts & Informal Sentences)
+    # B. Natural Language & Free-Text Pattern Extractions
 
     # 1. CUSTOMER NAME EXTRACTION
     if not data.get("customer_name") or is_edit:
         cust_patterns = [
             r"(?:customer\s*name|customer|client|reported\s*by|complaint\s*from|from)\s*(?:is|to|:|=)?\s*([A-Z0-9][A-Za-z0-9\s&.-]{1,50}?(?:Pharmacy|Hospital|Distributor|Labs|Laboratories|Clinic|Pharma|Healthcare|Medicals|Store|Wholesaler|Chemists?|Inc|Ltd|LLC|Pvt|Corp)?)\b",
             r"\b(Dr\.?\s*[A-Z][a-zA-Z0-9\s&.-]{1,40}(?:Labs|Laboratories|Pharma|Clinic)?)\b",
-            r"\b(Apollo\s+Pharmacy(?:\s+Ltd)?|MedPlus|Fortis\s+Hospital|Max\s+Healthcare|Sun\s+Pharma|Cipla|Reddy'?s?\s+Labs?)\b",
+            r"\b(Apollo\s+Pharmacy(?:\s+Ltd)?|MedPlus|Fortis\s+Hospital|Max\s+Healthcare|Sun\s+Pharma|Cipla|BioHealth\s+Laboratories(?:\s+Inc)?|Reddy'?s?\s+Labs?)\b",
             r"^([A-Z][a-zA-Z0-9\s&.-]{2,35}\s+(?:Pharmacy|Hospital|Distributor|Labs|Clinic|Pharma))\b"
         ]
         for pattern in cust_patterns:
@@ -170,7 +184,7 @@ def fallback_extract(prompt: str, current_form: Dict[str, Any] = None) -> Dict[s
 
     # 2. COMPLAINT SOURCE EXTRACTION
     if not data.get("complaint_source"):
-        source_match = re.search(r"(?:source|received\s*via|channel)\s*(?:is|:|=)?\s*(Email|Phone\s*Call|Customer\s*Portal|Distributor\s*Report|Letter|Field\s*Rep|Audit)", text, re.I)
+        source_match = re.search(r"(?:source|received\s*via|channel)\s*(?:is|:|=)?\s*(Email(?:\s*Notification)?|Phone\s*Call|Customer\s*Portal|Distributor\s*Report|Letter|Field\s*Rep|Audit)", text, re.I)
         if source_match:
             data["complaint_source"] = source_match.group(1).strip().title()
         elif data.get("customer_name"):
@@ -180,7 +194,7 @@ def fallback_extract(prompt: str, current_form: Dict[str, Any] = None) -> Dict[s
     if not data.get("product_name") or is_edit:
         prod_patterns = [
             r"(?:product\s*name|product|drug)\s*(?:is|to|:|=)\s*([A-Za-z0-9\s.-]{2,40})",
-            r"\b(Amoxicillin|Metformin(?:\s*Hydrochloride)?|Paracetamol|Ibuprofen|Ciprofloxacin|Atorvastatin|Omeprazole|Aspirin|Azithromycin|Ceftriaxone|Doxycycline|Augmentin|Cefalexin|Pantoprazole|Montelukast|Gabapentin|Lisinopril|Losartan)\b",
+            r"\b(Amoxicillin(?:\s*Capsules|\s*Tablets)?|Metformin(?:\s*Hydrochloride)?(?:\s*API)?|Paracetamol|Ibuprofen|Ciprofloxacin|Atorvastatin|Omeprazole|Aspirin|Azithromycin|Ceftriaxone|Doxycycline|Augmentin|Cefalexin|Pantoprazole|Montelukast|Gabapentin|Lisinopril|Losartan)\b",
             r"\b([A-Z][a-zA-Z0-9\-]{2,25}\s+(?:Capsules|Tablets|Injection|Syrup|API|Suspension|Ointment|Solution|Gel|Drops))\b"
         ]
         for pattern in prod_patterns:
@@ -192,9 +206,16 @@ def fallback_extract(prompt: str, current_form: Dict[str, Any] = None) -> Dict[s
                     data["product_name"] = found_prod.title()
                     break
 
+    # Extract product strength if embedded in product_name
+    if data.get("product_name") and not data.get("product_strength"):
+        str_in_prod = re.search(r"(\d+(?:\.\d+)?\s*(?:mg|g|mcg|ml|%|ip/bp|usp|iu|mg/ml))", data["product_name"], re.I)
+        if str_in_prod:
+            data["product_strength"] = str_in_prod.group(1).upper()
+            data["product_name"] = re.sub(r"\s*\d+(?:\.\d+)?\s*(?:mg|g|mcg|ml|%|ip/bp|usp|iu|mg/ml)", "", data["product_name"], flags=re.I).strip()
+
     # 4. PRODUCT STRENGTH EXTRACTION
     if not data.get("product_strength") or is_edit:
-        strength_match = re.search(r"(\d+(?:\.\d+)?\s*(?:mg|g|mcg|ml|%|ip/bp|usp|iu|mg/ml))", text, re.I)
+        strength_match = re.search(r"(\d+(?:\.\d+)?\s*(?:mg|g|mcg|ml|%|ip/bp|usp|iu|mg/ml)|(?:IP\s*/?\s*BP|USP|EP)\s*(?:Grade)?)", text, re.I)
         if strength_match:
             data["product_strength"] = strength_match.group(1).strip().upper()
 
@@ -217,14 +238,14 @@ def fallback_extract(prompt: str, current_form: Dict[str, Any] = None) -> Dict[s
     # 6. QUANTITY AFFECTED EXTRACTION
     if not data.get("quantity_affected") or is_edit:
         qty_patterns = [
-            r"(?:quantity\s*affected|quantity|qty|amount)\s*(?:is|to|:|=)?\s*(\d+\s*[a-zA-Z\s]+)",
-            r"(\d+\s*(?:capsules|tablets|vials|bottles|kg|drums|units|boxes|packs|pcs|pieces|strips|blisters|ampoules))"
+            r"(?:quantity\s*affected|quantity|qty|amount)\s*(?:is|to|:|=)?\s*(\d+\s*[a-zA-Z\s()]+)",
+            r"(\d+\s*(?:capsules|tablets|vials|bottles|kg|drums|units|boxes|packs|pcs|pieces|strips|blisters|ampoules)(?:\s*\([^)]+\))?)"
         ]
         for pattern in qty_patterns:
             match = re.search(pattern, text, re.I)
             if match:
                 found_qty = match.group(1).strip()
-                found_qty = re.split(r"\n|\r|Complaint|Detailed|Batch", found_qty, flags=re.I)[0].strip()
+                found_qty = re.split(r"\n|\r|\b(?:Complaint|Detailed|Batch)\b", found_qty, flags=re.I)[0].strip()
                 data["quantity_affected"] = found_qty
                 break
 
@@ -257,7 +278,7 @@ def fallback_extract(prompt: str, current_form: Dict[str, Any] = None) -> Dict[s
                     break
 
     # 9. COMPLAINT TYPE & RISK ASSESSMENT & PRECAUTIONS
-    if any(k in text_lower for k in ["discolor", "color", "colour", "appearance", "black spot", "yellowing"]):
+    if any(k in text_lower for k in ["discolor", "color", "colour", "appearance", "black spot", "yellowing", "spot"]):
         data["complaint_type"] = "Discoloration / Appearance"
         data["initial_severity"] = "Major"
         data["priority"] = "High"
@@ -266,7 +287,7 @@ def fallback_extract(prompt: str, current_form: Dict[str, Any] = None) -> Dict[s
         data["capa_recommendation"] = "Initiate retention sample inspection, review packaging environment logs."
         data["precautions"] = "STORAGE & STABILITY CAUTION: Segregate affected lot into quarantine zone. Store samples in light-protected, moisture-barrier containers at 15-25°C. Inspect retention samples immediately."
 
-    elif any(k in text_lower for k in ["particulate", "foreign", "impurity", "contamination", "glass", "hair", "metal"]):
+    elif any(k in text_lower for k in ["particulate", "foreign", "impurity", "contamination", "glass", "hair", "metal", "inclusion", "dark spot"]):
         data["complaint_type"] = "Foreign Matter / Contamination"
         data["initial_severity"] = "Critical"
         data["priority"] = "High"
@@ -331,13 +352,16 @@ def classify_intent_node(state: AgentState) -> AgentState:
 
 
 def extract_or_edit_node(state: AgentState) -> AgentState:
-    llm = get_llm()
     prompt = state["prompt"]
     current_form = state.get("current_form", {})
     intent = state.get("intent", "LOG_COMPLAINT")
 
+    candidates = get_llm_candidates()
     parsed_res = None
-    if llm:
+
+    from .prompts import QMS_EXTRACTION_PROMPT, QMS_EDIT_PROMPT
+
+    for llm in candidates:
         try:
             if intent == "EDIT_COMPLAINT":
                 sys_msg = SystemMessage(content=QMS_EDIT_PROMPT.format(
@@ -346,24 +370,26 @@ def extract_or_edit_node(state: AgentState) -> AgentState:
                 ))
             else:
                 sys_msg = SystemMessage(content=QMS_EXTRACTION_PROMPT)
-            
+
             response = llm.invoke([sys_msg, HumanMessage(content=prompt)])
             txt = response.content.strip()
-            # Extract JSON block
             jmatch = re.search(r"\{.*\}", txt, re.DOTALL)
             if jmatch:
-                parsed_res = json.loads(jmatch.group(0))
+                parsed = json.loads(jmatch.group(0))
+                if isinstance(parsed, dict) and (parsed.get("product_name") or parsed.get("batch_number") or parsed.get("complaint_type")):
+                    parsed_res = parsed
+                    break
         except Exception:
-            parsed_res = None
+            continue
 
     if not parsed_res:
-        parsed_res = fallback_extract(prompt, current_form if intent == "EDIT_COMPLAINT" else None)
+        parsed_res = fallback_extract(prompt, current_form if intent == "EDIT_COMPLAINT" else None, intent=intent)
 
     state["extracted_data"] = parsed_res
     state["action_taken"] = "EDITED" if intent == "EDIT_COMPLAINT" else "LOGGED"
     
     if intent == "EDIT_COMPLAINT":
-        state["reply_text"] = f"Updated complaint details based on your instructions. Modified fields have been reflected in the form."
+        state["reply_text"] = "Updated complaint details based on your instructions. Modified fields have been reflected in the form."
     else:
         prod = parsed_res.get('product_name') or 'N/A'
         batch = parsed_res.get('batch_number') or 'N/A'
@@ -374,6 +400,7 @@ def extract_or_edit_node(state: AgentState) -> AgentState:
 
 # Completeness Scoring
 def calculate_completeness(form_data: Dict[str, Any]) -> CompletenessCheckSchema:
+    from ..models import CompletenessCheckSchema
     required_fields = [
         ("customer_name", "Customer Name"),
         ("product_name", "Product Name"),
@@ -402,21 +429,25 @@ def calculate_completeness(form_data: Dict[str, Any]) -> CompletenessCheckSchema
 
 # Build LangGraph workflow
 def build_qms_graph():
-    workflow = StateGraph(AgentState)
-    
-    workflow.add_node("classify_intent", classify_intent_node)
-    workflow.add_node("extract_or_edit", extract_or_edit_node)
-    
-    workflow.set_entry_point("classify_intent")
-    workflow.add_edge("classify_intent", "extract_or_edit")
-    workflow.add_edge("extract_or_edit", END)
-    
-    return workflow.compile()
+    if not HAS_LANGGRAPH:
+        return None
+    try:
+        workflow = StateGraph(AgentState)
+        workflow.add_node("classify_intent", classify_intent_node)
+        workflow.add_node("extract_or_edit", extract_or_edit_node)
+        workflow.set_entry_point("classify_intent")
+        workflow.add_edge("classify_intent", "extract_or_edit")
+        workflow.add_edge("extract_or_edit", END)
+        return workflow.compile()
+    except Exception:
+        return None
 
 qms_graph_app = build_qms_graph()
 
 
 def process_qms_prompt(prompt: str, current_form: Dict[str, Any]) -> Dict[str, Any]:
+    from ..models import ComplaintFormSchema, RiskAssessmentSchema
+
     initial_state: AgentState = {
         "prompt": prompt,
         "current_form": current_form or {},
@@ -427,32 +458,50 @@ def process_qms_prompt(prompt: str, current_form: Dict[str, Any]) -> Dict[str, A
         "action_taken": ""
     }
     
-    final_state = qms_graph_app.invoke(initial_state)
+    if qms_graph_app:
+        try:
+            final_state = qms_graph_app.invoke(initial_state)
+        except Exception:
+            state = classify_intent_node(initial_state)
+            final_state = extract_or_edit_node(state)
+    else:
+        state = classify_intent_node(initial_state)
+        final_state = extract_or_edit_node(state)
+
     data = final_state["extracted_data"]
+    intent = final_state["intent"]
+
+    def get_val(key: str, default_val: str = ""):
+        extracted = data.get(key, "")
+        if extracted:
+            return extracted
+        if intent == "EDIT_COMPLAINT" and current_form:
+            return current_form.get(key, default_val)
+        return default_val
 
     form_obj = ComplaintFormSchema(
-        complaint_source=data.get("complaint_source", "") or (current_form.get("complaint_source", "") if current_form else ""),
-        customer_name=data.get("customer_name", "") or (current_form.get("customer_name", "") if current_form else ""),
-        product_name=data.get("product_name", "") or (current_form.get("product_name", "") if current_form else ""),
-        product_strength=data.get("product_strength", "") or (current_form.get("product_strength", "") if current_form else ""),
-        batch_number=data.get("batch_number", "") or (current_form.get("batch_number", "") if current_form else ""),
-        mfg_date=data.get("mfg_date", "") or (current_form.get("mfg_date", "") if current_form else ""),
-        expiry_date=data.get("expiry_date", "") or (current_form.get("expiry_date", "") if current_form else ""),
-        quantity_affected=data.get("quantity_affected", "") or (current_form.get("quantity_affected", "") if current_form else ""),
-        complaint_type=data.get("complaint_type", "") or (current_form.get("complaint_type", "") if current_form else ""),
-        complaint_date=data.get("complaint_date", "") or datetime.today().strftime("%Y-%m-%d"),
-        description=data.get("description", "") or (current_form.get("description", "") if current_form else ""),
-        initial_severity=data.get("initial_severity", "Major"),
-        priority=data.get("priority", "High")
+        complaint_source=get_val("complaint_source"),
+        customer_name=get_val("customer_name"),
+        product_name=get_val("product_name"),
+        product_strength=get_val("product_strength"),
+        batch_number=get_val("batch_number"),
+        mfg_date=get_val("mfg_date"),
+        expiry_date=get_val("expiry_date"),
+        quantity_affected=get_val("quantity_affected"),
+        complaint_type=get_val("complaint_type"),
+        complaint_date=get_val("complaint_date", datetime.today().strftime("%Y-%m-%d")),
+        description=get_val("description", prompt),
+        initial_severity=get_val("initial_severity", "Major"),
+        priority=get_val("priority", "High")
     )
 
     risk_obj = RiskAssessmentSchema(
-        initial_severity=data.get("initial_severity", "Major"),
-        priority=data.get("priority", "High"),
-        suggested_next_action=data.get("suggested_next_action", "Route to QA investigation & issue replacement"),
-        risk_reasoning=data.get("risk_reasoning", "Product quality anomaly reported. Technical investigation required."),
-        capa_recommendation=data.get("capa_recommendation", "Quarantine affected lot, initiate retention sample analysis."),
-        precautions=data.get("precautions", "STANDARD QMS PRECAUTION: Place batch on temporary quarantine hold pending QA physical inspection.")
+        initial_severity=data.get("initial_severity") or "Major",
+        priority=data.get("priority") or "High",
+        suggested_next_action=data.get("suggested_next_action") or "Route to QA investigation & issue replacement",
+        risk_reasoning=data.get("risk_reasoning") or "Product quality anomaly reported. Technical investigation required.",
+        capa_recommendation=data.get("capa_recommendation") or "Quarantine affected lot, initiate retention sample analysis.",
+        precautions=data.get("precautions") or "STANDARD QMS PRECAUTION: Place batch on temporary quarantine hold pending QA physical inspection."
     )
 
     completeness_obj = calculate_completeness(form_obj.model_dump())

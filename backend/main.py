@@ -9,7 +9,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from pypdf import PdfReader
+try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader = None
 
 try:
     import dotenv
@@ -105,6 +108,7 @@ async def extract_document_endpoint(file: UploadFile = File(...), db: Session = 
     try:
         if filename.endswith(".pdf"):
             import io
+            from pypdf import PdfReader
             reader = PdfReader(io.BytesIO(content_bytes))
             extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
         elif filename.endswith(".eml"):
@@ -134,7 +138,7 @@ async def extract_document_endpoint(file: UploadFile = File(...), db: Session = 
         extracted_text = f"Document content extracted from {file.filename} with sample pharma complaint data."
 
     # Process extracted text with agent
-    result = process_qms_prompt(f"Uploaded Document Content:\n{extracted_text}", {})
+    result = process_qms_prompt(extracted_text, {})
 
     # Check duplicates
     duplicate_found = False
